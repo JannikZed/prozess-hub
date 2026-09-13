@@ -169,6 +169,14 @@ export function processHubReducer(
   action: ProcessHubAction
 ): ProcessHubState {
   switch (action.type) {
+    case 'HYDRATE':
+      return {
+        processes: action.seed.processes,
+        events: action.seed.events,
+        tasks: action.seed.tasks,
+        selectedProcessId: action.seed.initialSelectedProcessId,
+        focusedTaskId: null,
+      }
     case 'SELECT_PROCESS':
       return {
         ...state,

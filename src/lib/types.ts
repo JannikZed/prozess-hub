@@ -280,6 +280,7 @@ export interface ProcessHubState {
 }
 
 export type ProcessHubAction =
+  | { type: 'HYDRATE'; seed: { processes: Process[]; events: TimelineEvent[]; tasks: Task[]; initialSelectedProcessId: string } }
   | { type: 'SELECT_PROCESS'; processId: string }
   | { type: 'FOCUS_TASK'; taskId: string | null }
   | { type: 'UPDATE_COMM_DRAFT'; taskId: string; draft: CommunicationDraft }
