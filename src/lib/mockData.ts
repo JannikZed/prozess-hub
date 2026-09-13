@@ -1,900 +1,307 @@
-import type { Process, Task, TimelineEvent } from './types'
-
+import type {
+  Attachment, Channel, CommunicationDraft, Confidence, Decision, ErpDraft,
+  EventDirection, FieldStatus, FieldValidation, Process, Task, TaskState,
+  TaskType, TimelineEvent, TimelineEventType,
+} from './types'
+const WM = 'proc-weizen-meyer'
+const PN = 'proc-preisupdate-nordkorn'
+const BS = 'proc-angebot-bauer-schmidt'
+const LS = 'proc-lieferschein-abweichung'
+const RK = 'proc-reklamation-fracht'
+const ZB = 'proc-zertifikat-bio'
+const MEYER = 'klaus.meyer@hof-meyer.example'
+const ANNA = 'anna.keller@agrohub.example'
+const ALO = 'disposition@agrarlogistik-ost.example'
+const SCHMIDT = 'info@bauer-schmidt.example'
+const L: Record<string, string> = {
+  contractNumber: 'Vertragsnr.', product: 'Artikel', quantityTons: 'Menge (t)',
+  deliveryWindow: 'Lieferfenster', partner: 'Partner', oldPriceEur: 'Alter Preis (€/t)',
+  newPriceEur: 'Neuer Preis (€/t)', validFrom: 'Gültig ab', staffel: 'Staffelpreis',
+  supplier: 'Lieferant', quoteNumber: 'Angebotsnr.', revision: 'Revision',
+  unitPriceEur: 'Preis (€/t)', validUntil: 'Gültig bis', margin: 'Marge',
+  deliveryNoteNumber: 'Lieferscheinnr.', declaredTons: 'Deklariert (t)', actualTons: 'Gewogen (t)',
+  warehouse: 'Lager', ticketNumber: 'Ticketnr.', weighedTons: 'Gewogen (t)',
+  deviationPercent: 'Abweichung (%)', vehiclePlate: 'Kennzeichen',
+  complaintRef: 'Reklamationsnr.', category: 'Kategorie', relatedDelivery: 'Tour/Lieferung',
+  claimedAmountEur: 'Forderung (€)', moisture: 'Feuchte gemessen', carrierClaim: 'Frachtführer',
+  certificateType: 'Zertifikatstyp', certificateNumber: 'Zertifikatsnr.',
+}
+type Cell = [string, string | number, FieldStatus?, string?, string?]
+const F = (cells: Cell[]): FieldValidation[] =>
+  cells.map(([field, value, status = 'ok', message, erpReference]) => ({
+    field, label: L[field] ?? field, value, status,
+    ...(message ? { message } : {}), ...(erpReference ? { erpReference } : {}),
+  }))
+const att = (name: string, type: Attachment['type'], sizeKb: number): Attachment => ({ name, type, sizeKb })
+const draft = (
+  to: string | string[], subject: string, body: string, channel: Channel = 'email',
+): CommunicationDraft => ({ channel, to, subject, body, suggestedByAi: true })
+const pv = (s: string) => {
+  const t = s.replace(/\s+/g, ' ').trim()
+  return t.length <= 64 ? t : `${t.slice(0, 63)}…`
+}
+type X = Partial<Pick<TimelineEvent, 'from' | 'to' | 'subject' | 'attachments' | 'linkedTaskIds' | 'durationMinutes' | 'callDirection' | 'suggestedFollowUps'>>
+const ev = (
+  id: string, processId: string, channel: Channel, direction: EventDirection,
+  type: TimelineEventType, ts: string, body: string, x: X = {},
+): TimelineEvent => ({
+  id, processId, channel, direction, type, timestamp: ts, bodyPreview: pv(body), bodyFull: body, ...x,
+})
+type TO = {
+  state?: TaskState; confidence?: Confidence; erp?: ErpDraft; comm?: CommunicationDraft
+  decisions?: Decision[]; blockingReason?: string
+  groupId?: string; groupIndex?: number; groupTotal?: number
+}
+const task = (
+  id: string, processId: string, taskType: TaskType, title: string, src: string[], o: TO = {},
+): Task => ({
+  id, processId, taskType, title, sourceEventIds: src,
+  state: o.state ?? 'open', confidence: o.confidence ?? 'high',
+  erpDraft: o.erp, communicationDraft: o.comm, decisions: o.decisions, blockingReason: o.blockingReason,
+  groupId: o.groupId, groupIndex: o.groupIndex, groupTotal: o.groupTotal,
+})
+function abruf(i: number, window: string, conf: Confidence = 'high', warn?: string, partner = false): Task {
+  const short = ['KW38 Di', 'KW38 Do', 'KW39', 'KW40', 'KW42'][i - 1]
+  const cells: Cell[] = [
+    ['contractNumber', 'VH-2026-0412', 'ok', undefined, partner ? 'VERTRAG/0412' : undefined],
+    ['product', 'Weizen Qualität A', 'ok', undefined, partner ? 'ART-WEI-A' : undefined],
+    ['quantityTons', 50],
+    warn ? ['deliveryWindow', window, 'warning', warn] : ['deliveryWindow', window],
+  ]
+  if (partner) cells.push(['partner', 'Hof Meyer', 'ok', undefined, 'KUN-10042'])
+  return task(`task-wm-${i}`, WM, 'contract_call', `Abruf ${i}/5 — 50 t Weizen ${short}`,
+    i <= 2 ? ['ev-wm-01', 'ev-wm-02'] : ['ev-wm-01'], {
+      confidence: conf, groupId: 'grp-wm-abrufe', groupIndex: i, groupTotal: 5,
+      erp: {
+        kind: 'contract_call', contractNumber: 'VH-2026-0412', product: 'Weizen Qualität A',
+        quantityTons: 50, deliveryWindow: window, callReference: `ABR-0412-0${i}`, fields: F(cells),
+      },
+      comm: i === 1
+        ? draft(MEYER, 'Bestätigung Abruf 1/5', 'Abruf 1/5: 50 t Weizen A, KW38 Di.')
+        : i === 2
+          ? { channel: 'whatsapp', to: '+49 170 1112233', body: 'Abruf 2/5: 50 t KW38 Do.', suggestedByAi: true }
+          : undefined,
+    })
+}
+function proc(
+  id: string, title: string, partnerName: string, partnerType: Process['partnerType'],
+  channelMix: Channel[], lifecycleState: Process['lifecycleState'], negotiationSummary: string,
+  priority: Process['priority'], confidence: Confidence, assignedTo: string,
+  openTaskCount: number, lastActivityAt: string, tags: string[],
+): Process {
+  return {
+    id, title, partnerName, partnerType, channelMix, lifecycleState, negotiationSummary,
+    priority, confidence, assignedTo, openTaskCount, lastActivityAt, tags,
+  }
+}
 export const processes: Process[] = [
-  {
-    id: 'proc-weizen-meyer',
-    title: 'Weizen Abrufe — Vertrag VH-2026-0412',
-    partnerName: 'Hof Meyer',
-    partnerType: 'customer',
-    channelMix: ['whatsapp', 'email', 'phone'],
-    lifecycleState: 'ready_for_erp',
-    negotiationSummary:
-      'Kunde ruft 5 Teilmengen Weizen (Qualität A) aus Rahmenvertrag ab. Termine KW 38–42, Gesamtmenge 250 t. Preise und Qualitäten bestätigt. Bereit zur ERP-Buchung der Abrufe.',
-    priority: 'high',
-    confidence: 'high',
-    assignedTo: 'Anna Keller',
-    openTaskCount: 5,
-    lastActivityAt: '2026-09-13T14:42:00Z',
-    tags: ['Abruf', 'Weizen', 'Batch'],
-  },
-  {
-    id: 'proc-preisupdate-nordkorn',
-    title: 'Preisupdate Gerste — Nordkorn AG',
-    partnerName: 'Nordkorn AG',
-    partnerType: 'supplier',
-    channelMix: ['email'],
-    lifecycleState: 'awaiting_internal',
-    negotiationSummary:
-      'Lieferant meldet Preisanpassung Gerste Futterware +4,20 €/t ab 15.09. Zwei Felder mit Warnung (gültige Kontrakte, Staffelpreis). Freigabe Intern erforderlich.',
-    priority: 'high',
-    confidence: 'medium',
-    assignedTo: 'Tom Richter',
-    openTaskCount: 1,
-    lastActivityAt: '2026-09-13T11:18:00Z',
-    tags: ['Preis', 'Gerste', 'Freigabe'],
-  },
-  {
-    id: 'proc-angebot-bauer-schmidt',
-    title: 'Angebot Raps — Bauer Schmidt',
-    partnerName: 'Bauer Schmidt',
-    partnerType: 'customer',
-    channelMix: ['email', 'phone'],
-    lifecycleState: 'awaiting_partner',
-    negotiationSummary:
-      'Angebot ANG-2026-889 für 80 t Raps erstellt und einmal revidiert (−1,50 €/t). Wartet auf Kundenantwort. Telefonnotiz mit Nachfass-Vorschlag hinterlegt.',
-    priority: 'medium',
-    confidence: 'high',
-    assignedTo: 'Anna Keller',
-    openTaskCount: 1,
-    lastActivityAt: '2026-09-12T16:05:00Z',
-    tags: ['Angebot', 'Raps'],
-  },
-  {
-    id: 'proc-lieferschein-abweichung',
-    title: 'Lieferschein-Abweichung LS-78421',
-    partnerName: 'AgrarLogistik Ost',
-    partnerType: 'carrier',
-    channelMix: ['email', 'whatsapp', 'phone'],
-    lifecycleState: 'awaiting_internal',
-    negotiationSummary:
-      'Lieferschein 120 t Weizen deklariert, Waage 116,4 t (−3,0 %). Gewichtsschein und Fotos vorhanden. Entscheidung: Nachberechnung, Kulanz oder Reklamation.',
-    priority: 'high',
-    confidence: 'medium',
-    assignedTo: 'Tom Richter',
-    openTaskCount: 2,
-    lastActivityAt: '2026-09-13T13:55:00Z',
-    tags: ['Waage', 'Abweichung', 'LS'],
-  },
-  {
-    id: 'proc-reklamation-fracht',
-    title: 'Reklamation Fracht — Feuchtigkeit',
-    partnerName: 'Spedition Grünfeld',
-    partnerType: 'carrier',
-    channelMix: ['email', 'phone', 'telegram'],
-    lifecycleState: 'awaiting_internal',
-    negotiationSummary:
-      'Kunde meldet Feuchtigkeitsüberschreitung bei Anlieferung Mais. Frachtführer bestreitet Ursache. Aufgabe blockiert — Entscheidung zu Haftung/Gutschrift ausstehend.',
-    priority: 'high',
-    confidence: 'low',
-    assignedTo: 'Lisa Braun',
-    openTaskCount: 1,
-    lastActivityAt: '2026-09-13T09:30:00Z',
-    tags: ['Reklamation', 'Fracht', 'Mais'],
-  },
-  {
-    id: 'proc-zertifikat-bio',
-    title: 'Bio-Zertifikat Nachreichung',
-    partnerName: 'ÖkoHof Linden',
-    partnerType: 'supplier',
-    channelMix: ['email'],
-    lifecycleState: 'intake',
-    negotiationSummary:
-      'Lieferant sendet aktualisiertes Bio-Zertifikat (gültig bis 31.12.2027). Prüfung und ERP-Anlage ausstehend.',
-    priority: 'low',
-    confidence: 'high',
-    assignedTo: 'Anna Keller',
-    openTaskCount: 1,
-    lastActivityAt: '2026-09-11T10:12:00Z',
-    tags: ['Zertifikat', 'Bio'],
-  },
+  proc(WM, 'Weizen Abrufe — Vertrag VH-2026-0412', 'Hof Meyer', 'customer',
+    ['whatsapp', 'email', 'phone'], 'ready_for_erp',
+    '5 Abrufe Weizen A (250 t, KW 38–42) — bereit zur ERP-Buchung.',
+    'high', 'high', 'Anna Keller', 5, '2026-09-13T14:42:00Z', ['Abruf', 'Weizen', 'Batch']),
+  proc(PN, 'Preisupdate Gerste — Nordkorn AG', 'Nordkorn AG', 'supplier',
+    ['email'], 'awaiting_internal', 'Gerste +4,20 €/t ab 15.09. — Freigabe nötig.',
+    'high', 'medium', 'Tom Richter', 1, '2026-09-13T11:18:00Z', ['Preis', 'Gerste', 'Freigabe']),
+  proc(BS, 'Angebot Raps — Bauer Schmidt', 'Bauer Schmidt', 'customer',
+    ['email', 'phone'], 'awaiting_partner', 'ANG-2026-889 (80 t) revidiert auf 510,50 €/t — wartet.',
+    'medium', 'high', 'Anna Keller', 1, '2026-09-12T16:05:00Z', ['Angebot', 'Raps']),
+  proc(LS, 'Lieferschein-Abweichung LS-78421', 'AgrarLogistik Ost', 'carrier',
+    ['email', 'whatsapp', 'phone'], 'awaiting_internal', 'LS 120 t / Waage 116,4 t (−3 %). Entscheidung nötig.',
+    'high', 'medium', 'Tom Richter', 2, '2026-09-13T13:55:00Z', ['Waage', 'Abweichung', 'LS']),
+  proc(RK, 'Reklamation Fracht — Feuchtigkeit', 'Spedition Grünfeld', 'carrier',
+    ['email', 'phone', 'telegram'], 'awaiting_internal', 'Mais-Feuchte überschritten; Frachtführer bestreitet.',
+    'high', 'low', 'Lisa Braun', 1, '2026-09-13T09:30:00Z', ['Reklamation', 'Fracht', 'Mais']),
+  proc(ZB, 'Bio-Zertifikat Nachreichung', 'ÖkoHof Linden', 'supplier',
+    ['email'], 'intake', 'Bio-Zertifikat bis 31.12.2027 — ERP-Anlage offen.',
+    'low', 'high', 'Anna Keller', 1, '2026-09-11T10:12:00Z', ['Zertifikat', 'Bio']),
 ]
-
+const wmAll = ['task-wm-1', 'task-wm-2', 'task-wm-3', 'task-wm-4', 'task-wm-5']
 export const events: TimelineEvent[] = [
-  // --- proc-weizen-meyer ---
-  {
-    id: 'ev-wm-01',
-    processId: 'proc-weizen-meyer',
-    channel: 'email',
-    direction: 'inbound',
-    type: 'email_in',
-    timestamp: '2026-09-10T08:15:00Z',
-    from: 'klaus.meyer@hof-meyer.example',
-    to: 'innendienst@agrohub.example',
-    subject: 'Abrufe Weizen Vertrag VH-2026-0412',
-    bodyPreview: 'Guten Morgen, wir möchten aus dem Rahmenvertrag Weizen abrufen…',
-    bodyFull:
-      'Guten Morgen,\n\nwir möchten aus dem Rahmenvertrag VH-2026-0412 insgesamt 250 t Weizen Qualität A in fünf Teillieferungen abrufen (je 50 t), KW 38–42.\n\nBitte bestätigen Sie Termine und Abwicklung.\n\nMit freundlichen Grüßen\nKlaus Meyer\nHof Meyer',
-    attachments: [{ name: 'Abrufplan_KW38-42.xlsx', type: 'xlsx', sizeKb: 48 }],
-    linkedTaskIds: ['task-wm-1', 'task-wm-2', 'task-wm-3', 'task-wm-4', 'task-wm-5'],
-  },
-  {
-    id: 'ev-wm-02',
-    processId: 'proc-weizen-meyer',
-    channel: 'whatsapp',
-    direction: 'inbound',
-    type: 'whatsapp_in',
-    timestamp: '2026-09-11T09:40:00Z',
-    from: '+49 170 1112233 (Hof Meyer)',
-    to: 'AgroHub Innendienst',
-    bodyPreview: 'Können Abruf 1 und 2 auf Di/Do KW38?',
-    bodyFull: 'Hallo Anna, können Abruf 1 und 2 bitte auf Di und Do in KW38 gelegt werden? Danke!',
-    linkedTaskIds: ['task-wm-1', 'task-wm-2'],
-  },
-  {
-    id: 'ev-wm-03',
-    processId: 'proc-weizen-meyer',
-    channel: 'phone',
-    direction: 'internal',
-    type: 'phone_note',
-    timestamp: '2026-09-12T11:20:00Z',
-    from: 'Anna Keller',
-    bodyPreview: 'Telefonat 8 Min.: Termine bestätigt, Qualität A ok.',
-    bodyFull:
-      'Gespräch mit Klaus Meyer. Bestätigt: 5×50 t, Qualität A, Anlieferung Hof. Keine Feuchtigkeitszuschläge erwartet. Kunde wünscht Buchungsbestätigung per E-Mail.',
-    durationMinutes: 8,
-    callDirection: 'outbound',
-    suggestedFollowUps: [
-      {
-        id: 'sf-wm-1',
-        label: 'Bestätigung E-Mail senden',
-        taskType: 'reply',
-        prefillDraft: {
-          channel: 'email',
-          to: 'klaus.meyer@hof-meyer.example',
-          subject: 'Bestätigung Abrufe VH-2026-0412',
-          body: 'Guten Tag Herr Meyer,\n\nwir bestätigen Ihre fünf Abrufe à 50 t Weizen Qualität A (KW 38–42).\n\nFreundliche Grüße\nAnna Keller\nAgroHub GmbH',
-          suggestedByAi: true,
-        },
-      },
-    ],
-    linkedTaskIds: ['task-wm-1'],
-  },
-  {
-    id: 'ev-wm-04',
-    processId: 'proc-weizen-meyer',
-    channel: 'email',
-    direction: 'outbound',
-    type: 'email_out',
-    timestamp: '2026-09-12T14:00:00Z',
-    from: 'anna.keller@agrohub.example',
-    to: 'klaus.meyer@hof-meyer.example',
-    subject: 'RE: Abrufe Weizen Vertrag VH-2026-0412',
-    bodyPreview: 'Vielen Dank — wir legen die fünf Abrufe wie besprochen an…',
-    bodyFull:
-      'Guten Tag Herr Meyer,\n\nvielen Dank. Wir legen die fünf Abrufe wie telefonisch besprochen an und buchen sie im ERP.\n\nFreundliche Grüße\nAnna Keller',
-  },
-  {
-    id: 'ev-wm-05',
-    processId: 'proc-weizen-meyer',
-    channel: 'whatsapp',
-    direction: 'inbound',
-    type: 'whatsapp_in',
-    timestamp: '2026-09-13T14:42:00Z',
-    from: '+49 170 1112233 (Hof Meyer)',
-    to: 'AgroHub Innendienst',
-    bodyPreview: 'Super, danke! Bitte Buchung durchführen.',
-    bodyFull: 'Super, danke Anna! Bitte die Buchungen durchführen.',
-  },
-
-  // --- proc-preisupdate-nordkorn ---
-  {
-    id: 'ev-pn-01',
-    processId: 'proc-preisupdate-nordkorn',
-    channel: 'email',
-    direction: 'inbound',
-    type: 'email_in',
-    timestamp: '2026-09-13T10:45:00Z',
-    from: 'einkauf@nordkorn.example',
-    to: 'einkauf@agrohub.example',
-    subject: 'Preisanpassung Gerste Futterware ab 15.09.2026',
-    bodyPreview: 'Sehr geehrte Damen und Herren, hiermit informieren wir über…',
-    bodyFull:
-      'Sehr geehrte Damen und Herren,\n\nhiermit informieren wir Sie über eine Preisanpassung für Gerste Futterware:\n\nBisher: 198,50 €/t\nNeu: 202,70 €/t\nGültig ab: 15.09.2026\n\nBestehende Kontrakte mit Fixpreis bleiben unberührt; Abrufe ohne Fixpreis folgen dem neuen Listenpreis.\n\nMit freundlichen Grüßen\nEinkauf Nordkorn AG',
-    attachments: [
-      { name: 'Preisliste_Gerste_Sep2026.pdf', type: 'pdf', sizeKb: 220 },
-      { name: 'Staffel_Uebersicht.xlsx', type: 'xlsx', sizeKb: 64 },
-    ],
-    linkedTaskIds: ['task-pn-1'],
-  },
-  {
-    id: 'ev-pn-02',
-    processId: 'proc-preisupdate-nordkorn',
-    channel: 'email',
-    direction: 'internal',
-    type: 'system',
-    timestamp: '2026-09-13T11:18:00Z',
-    bodyPreview: 'KI: 2 offene Kontrakte ohne Fixpreis betroffen — Freigabe empfohlen.',
-    bodyFull:
-      'Automatische Prüfung: Kontrakte NK-441 und NK-455 referenzieren Listenpreis Gerste. Preisupdate würde Abrufkosten um ca. 4.200 € erhöhen. Interne Freigabe empfohlen.',
-    linkedTaskIds: ['task-pn-1'],
-  },
-
-  // --- proc-angebot-bauer-schmidt ---
-  {
-    id: 'ev-bs-01',
-    processId: 'proc-angebot-bauer-schmidt',
-    channel: 'email',
-    direction: 'inbound',
-    type: 'email_in',
-    timestamp: '2026-09-09T13:10:00Z',
-    from: 'info@bauer-schmidt.example',
-    to: 'vertrieb@agrohub.example',
-    subject: 'Anfrage Raps 80 t Ernte 2026',
-    bodyPreview: 'Wir benötigen ein Angebot über 80 t Raps…',
-    bodyFull:
-      'Guten Tag,\n\nwir benötigen ein Angebot über 80 t Raps (Ernte 2026), Lieferung Oktober, ab Hof.\n\nMit freundlichen Grüßen\nFamilie Schmidt',
-    linkedTaskIds: ['task-bs-1'],
-  },
-  {
-    id: 'ev-bs-02',
-    processId: 'proc-angebot-bauer-schmidt',
-    channel: 'email',
-    direction: 'outbound',
-    type: 'email_out',
-    timestamp: '2026-09-10T09:30:00Z',
-    from: 'anna.keller@agrohub.example',
-    to: 'info@bauer-schmidt.example',
-    subject: 'Angebot ANG-2026-889 — Raps 80 t',
-    bodyPreview: 'anbei unser Angebot ANG-2026-889…',
-    bodyFull:
-      'Guten Tag Familie Schmidt,\n\nanbei unser Angebot ANG-2026-889 über 80 t Raps zu 512,00 €/t, gültig bis 20.09.2026.\n\nFreundliche Grüße\nAnna Keller',
-    attachments: [{ name: 'ANG-2026-889.pdf', type: 'pdf', sizeKb: 112 }],
-  },
-  {
-    id: 'ev-bs-03',
-    processId: 'proc-angebot-bauer-schmidt',
-    channel: 'phone',
-    direction: 'internal',
-    type: 'phone_note',
-    timestamp: '2026-09-11T15:45:00Z',
-    from: 'Anna Keller',
-    bodyPreview: 'Kunde: Preis etwas hoch — Revision −1,50 €/t zugesagt.',
-    bodyFull:
-      'Telefonat 6 Min. Herr Schmidt findet 512 € etwas hoch. Zugesagt: Revision auf 510,50 €/t. Neues PDF nachsenden.',
-    durationMinutes: 6,
-    callDirection: 'inbound',
-    suggestedFollowUps: [
-      {
-        id: 'sf-bs-1',
-        label: 'Revidiertes Angebot senden',
-        taskType: 'revise_quote',
-      },
-    ],
-    linkedTaskIds: ['task-bs-2'],
-  },
-  {
-    id: 'ev-bs-04',
-    processId: 'proc-angebot-bauer-schmidt',
-    channel: 'email',
-    direction: 'outbound',
-    type: 'email_out',
-    timestamp: '2026-09-12T10:00:00Z',
-    from: 'anna.keller@agrohub.example',
-    to: 'info@bauer-schmidt.example',
-    subject: 'RE: Angebot ANG-2026-889 Rev. 1',
-    bodyPreview: 'Revidiertes Angebot: 510,50 €/t…',
-    bodyFull:
-      'Guten Tag,\n\nwie besprochen senden wir die Revision 1: 510,50 €/t, gültig bis 22.09.2026.\n\nFreundliche Grüße\nAnna Keller',
-    attachments: [{ name: 'ANG-2026-889_Rev1.pdf', type: 'pdf', sizeKb: 115 }],
-  },
-  {
-    id: 'ev-bs-05',
-    processId: 'proc-angebot-bauer-schmidt',
-    channel: 'email',
-    direction: 'internal',
-    type: 'system',
-    timestamp: '2026-09-12T16:05:00Z',
-    bodyPreview: 'Status: wartend auf Partnerantwort.',
-    bodyFull: 'Prozess auf awaiting_partner gesetzt. Reminder in 3 Werktagen vorgeschlagen.',
-  },
-
-  // --- proc-lieferschein-abweichung ---
-  {
-    id: 'ev-ls-01',
-    processId: 'proc-lieferschein-abweichung',
-    channel: 'email',
-    direction: 'inbound',
-    type: 'email_in',
-    timestamp: '2026-09-13T07:50:00Z',
-    from: 'disposition@agrarlogistik-ost.example',
-    to: 'logistik@agrohub.example',
-    subject: 'LS-78421 Weizen — Anlieferung Lager Nord',
-    bodyPreview: 'Anbei Lieferschein LS-78421, 120 t Weizen…',
-    bodyFull:
-      'Guten Morgen,\n\nanbei Lieferschein LS-78421 für 120 t Weizen, Ziel Lager Nord, Kennzeichen OS-AL 441.\n\nMit freundlichen Grüßen\nDisposition AgrarLogistik Ost',
-    attachments: [{ name: 'LS-78421.pdf', type: 'pdf', sizeKb: 180 }],
-    linkedTaskIds: ['task-ls-1'],
-  },
-  {
-    id: 'ev-ls-02',
-    processId: 'proc-lieferschein-abweichung',
-    channel: 'email',
-    direction: 'inbound',
-    type: 'email_in',
-    timestamp: '2026-09-13T12:10:00Z',
-    from: 'waage@lager-nord.example',
-    to: 'logistik@agrohub.example',
-    subject: 'Gewichtsschein WS-99102 zu LS-78421',
-    bodyPreview: 'Gewogen: 116,4 t (Abweichung −3,0 %)…',
-    bodyFull:
-      'Automatischer Waagenbericht:\nTicket WS-99102\nDeklariert: 120,0 t\nGewogen: 116,4 t\nAbweichung: −3,0 %\nKennzeichen: OS-AL 441\n\nFotos im Anhang.',
-    attachments: [
-      { name: 'WS-99102.pdf', type: 'pdf', sizeKb: 95 },
-      { name: 'waage_foto1.jpg', type: 'image', sizeKb: 420 },
-    ],
-    linkedTaskIds: ['task-ls-2'],
-  },
-  {
-    id: 'ev-ls-03',
-    processId: 'proc-lieferschein-abweichung',
-    channel: 'whatsapp',
-    direction: 'inbound',
-    type: 'whatsapp_in',
-    timestamp: '2026-09-13T12:40:00Z',
-    from: '+49 151 9988776 (Fahrer)',
-    to: 'AgroHub Logistik',
-    bodyPreview: 'Waage zeigte weniger — war alles voll beladen.',
-    bodyFull: 'Hallo, die Waage zeigte weniger an. Lkw war voll beladen, evtl. Kalibrierung?',
-  },
-  {
-    id: 'ev-ls-04',
-    processId: 'proc-lieferschein-abweichung',
-    channel: 'phone',
-    direction: 'internal',
-    type: 'phone_note',
-    timestamp: '2026-09-13T13:55:00Z',
-    from: 'Tom Richter',
-    bodyPreview: 'Dispo: Nachwiegen nicht möglich, Entscheidung Intern.',
-    bodyFull:
-      'Gespräch 5 Min. mit Disposition. Nachwiegen nicht mehr möglich (Entladung erfolgt). Bitte interne Entscheidung zu Differenzmenge.',
-    durationMinutes: 5,
-    callDirection: 'outbound',
-    suggestedFollowUps: [
-      {
-        id: 'sf-ls-1',
-        label: 'Differenz an Lieferanten melden',
-        taskType: 'reply',
-        prefillDraft: {
-          channel: 'email',
-          to: 'disposition@agrarlogistik-ost.example',
-          subject: 'Differenz LS-78421 / WS-99102',
-          body: 'Guten Tag,\n\nbei LS-78421 ergibt die Waage 116,4 t statt 120 t (−3 %). Bitte um Stellungnahme.\n\nFreundliche Grüße\nTom Richter',
-          suggestedByAi: true,
-        },
-      },
-    ],
-  },
-
-  // --- proc-reklamation-fracht ---
-  {
-    id: 'ev-rk-01',
-    processId: 'proc-reklamation-fracht',
-    channel: 'email',
-    direction: 'inbound',
-    type: 'email_in',
-    timestamp: '2026-09-12T08:20:00Z',
-    from: 'qualitaet@hof-meyer.example',
-    to: 'reklamation@agrohub.example',
-    subject: 'Reklamation Mais Anlieferung 11.09. — Feuchte',
-    bodyPreview: 'Feuchtigkeitsmessung 16,8 % (Soll max 15 %)…',
-    bodyFull:
-      'Sehr geehrte Damen und Herren,\n\nbei der Anlieferung Mais am 11.09. (Tour GF-228) haben wir 16,8 % Feuchte gemessen (Soll max. 15 %). Wir fordern Gutschrift bzw. Trocknungskostenersatz in Höhe von 1.850 €.\n\nMessprotokoll im Anhang.\n\nMit freundlichen Grüßen\nQualitätsmanagement Hof Meyer',
-    attachments: [
-      { name: 'Messprotokoll_Mais_1109.pdf', type: 'pdf', sizeKb: 140 },
-      { name: 'Laborwerte.xlsx', type: 'xlsx', sizeKb: 32 },
-    ],
-    linkedTaskIds: ['task-rk-1'],
-  },
-  {
-    id: 'ev-rk-02',
-    processId: 'proc-reklamation-fracht',
-    channel: 'telegram',
-    direction: 'inbound',
-    type: 'telegram_in',
-    timestamp: '2026-09-12T14:05:00Z',
-    from: 'Spedition Grünfeld Dispo',
-    to: 'AgroHub Reklamation',
-    bodyPreview: 'Feuchte lag bei Verladung bei 14,2 % — nicht unsere Schuld.',
-    bodyFull:
-      'Hallo, laut unserer Verladeprobe lag die Feuchte bei 14,2 %. Wir sehen keine Haftung. Planenprotokoll können wir nachreichen.',
-  },
-  {
-    id: 'ev-rk-03',
-    processId: 'proc-reklamation-fracht',
-    channel: 'phone',
-    direction: 'internal',
-    type: 'phone_note',
-    timestamp: '2026-09-13T09:30:00Z',
-    from: 'Lisa Braun',
-    bodyPreview: 'Beide Seiten beharren — Entscheidung Geschäftsleitung nötig.',
-    bodyFull:
-      'Telefonate mit Kunde und Spedition. Keine Einigung. Vorschlag: 50/50 Kulanz oder externe Probe. Aufgabe blockiert bis Entscheidung.',
-    durationMinutes: 18,
-    callDirection: 'outbound',
-    suggestedFollowUps: [
-      {
-        id: 'sf-rk-1',
-        label: 'Kulanzangebot an Kunden',
-        taskType: 'reply',
-      },
-      {
-        id: 'sf-rk-2',
-        label: 'Stellungnahme an Frachtführer',
-        taskType: 'reply',
-      },
-    ],
-    linkedTaskIds: ['task-rk-1'],
-  },
-
-  // --- proc-zertifikat-bio ---
-  {
-    id: 'ev-zb-01',
-    processId: 'proc-zertifikat-bio',
-    channel: 'email',
-    direction: 'inbound',
-    type: 'email_in',
-    timestamp: '2026-09-11T10:12:00Z',
-    from: 'buero@oekohof-linden.example',
-    to: 'qualitaet@agrohub.example',
-    subject: 'Aktualisiertes Bio-Zertifikat 2026/27',
-    bodyPreview: 'Anbei unser neues Bio-Zertifikat…',
-    bodyFull:
-      'Guten Tag,\n\nanbei unser aktualisiertes Bio-Zertifikat, gültig bis 31.12.2027.\n\nFreundliche Grüße\nÖkoHof Linden',
-    attachments: [{ name: 'BioZertifikat_Linden_2027.pdf', type: 'pdf', sizeKb: 860 }],
-    linkedTaskIds: ['task-zb-1'],
-  },
+  ev('ev-wm-01', WM, 'email', 'inbound', 'email_in', '2026-09-10T08:15:00Z',
+    'Abruf VH-2026-0412: 250 t Weizen A, 5×50 t, KW 38–42.',
+    { from: MEYER, to: 'innendienst@agrohub.example', subject: 'Abrufe Weizen VH-2026-0412',
+      attachments: [att('Abrufplan_KW38-42.xlsx', 'xlsx', 48)], linkedTaskIds: wmAll }),
+  ev('ev-wm-02', WM, 'whatsapp', 'inbound', 'whatsapp_in', '2026-09-11T09:40:00Z',
+    'Abruf 1+2 bitte Di/Do KW38?',
+    { from: '+49 170 1112233 (Hof Meyer)', to: 'AgroHub Innendienst', linkedTaskIds: ['task-wm-1', 'task-wm-2'] }),
+  ev('ev-wm-03', WM, 'phone', 'internal', 'phone_note', '2026-09-12T11:20:00Z',
+    'Tel. Meyer: 5×50 t Qualität A ok.',
+    { from: 'Anna Keller', durationMinutes: 8, callDirection: 'outbound', linkedTaskIds: ['task-wm-1'],
+      suggestedFollowUps: [{ id: 'sf-wm-1', label: 'Bestätigung E-Mail senden', taskType: 'reply',
+        prefillDraft: draft(MEYER, 'Bestätigung Abrufe', 'Fünf Abrufe à 50 t Weizen A bestätigt.') }] }),
+  ev('ev-wm-04', WM, 'email', 'outbound', 'email_out', '2026-09-12T14:00:00Z',
+    'Wir legen die fünf Abrufe an und buchen im ERP.',
+    { from: ANNA, to: MEYER, subject: 'RE: Abrufe Weizen VH-2026-0412' }),
+  ev('ev-wm-05', WM, 'whatsapp', 'inbound', 'whatsapp_in', '2026-09-13T14:42:00Z',
+    'Super, danke! Bitte Buchung durchführen.',
+    { from: '+49 170 1112233 (Hof Meyer)', to: 'AgroHub Innendienst' }),
+  ev('ev-pn-01', PN, 'email', 'inbound', 'email_in', '2026-09-13T10:45:00Z',
+    'Gerste: 198,50 → 202,70 €/t ab 15.09. Fixpreise unberührt.',
+    { from: 'einkauf@nordkorn.example', to: 'einkauf@agrohub.example', subject: 'Preisanpassung Gerste ab 15.09.',
+      attachments: [att('Preisliste_Gerste_Sep2026.pdf', 'pdf', 220)], linkedTaskIds: ['task-pn-1'] }),
+  ev('ev-pn-02', PN, 'email', 'internal', 'system', '2026-09-13T11:18:00Z',
+    'KI: NK-441/NK-455 ohne Fixpreis (~+4.200 €).', { linkedTaskIds: ['task-pn-1'] }),
+  ev('ev-bs-01', BS, 'email', 'inbound', 'email_in', '2026-09-09T13:10:00Z',
+    'Angebot 80 t Raps Ernte 2026, Lieferung Oktober, ab Hof.',
+    { from: SCHMIDT, to: 'vertrieb@agrohub.example', subject: 'Anfrage Raps 80 t', linkedTaskIds: ['task-bs-1'] }),
+  ev('ev-bs-02', BS, 'email', 'outbound', 'email_out', '2026-09-10T09:30:00Z',
+    'ANG-2026-889: 80 t Raps, 512 €/t, gültig bis 20.09.',
+    { from: ANNA, to: SCHMIDT, subject: 'Angebot ANG-2026-889', attachments: [att('ANG-2026-889.pdf', 'pdf', 112)] }),
+  ev('ev-bs-03', BS, 'phone', 'internal', 'phone_note', '2026-09-11T15:45:00Z',
+    'Tel.: Preis zu hoch — Revision 510,50 €/t zugesagt.',
+    { from: 'Anna Keller', durationMinutes: 6, callDirection: 'inbound', linkedTaskIds: ['task-bs-2'],
+      suggestedFollowUps: [{ id: 'sf-bs-1', label: 'Revidiertes Angebot senden', taskType: 'revise_quote' }] }),
+  ev('ev-bs-04', BS, 'email', 'outbound', 'email_out', '2026-09-12T10:00:00Z',
+    'Revision 1: 510,50 €/t, gültig bis 22.09.',
+    { from: ANNA, to: SCHMIDT, subject: 'RE: ANG-2026-889 Rev. 1', attachments: [att('ANG-2026-889_Rev1.pdf', 'pdf', 115)] }),
+  ev('ev-bs-05', BS, 'email', 'internal', 'system', '2026-09-12T16:05:00Z',
+    'Status awaiting_partner. Reminder in 3 Werktagen.'),
+  ev('ev-ls-01', LS, 'email', 'inbound', 'email_in', '2026-09-13T07:50:00Z',
+    'LS-78421: 120 t Weizen, Lager Nord, Kfz OS-AL 441.',
+    { from: ALO, to: 'logistik@agrohub.example', subject: 'LS-78421 Weizen Lager Nord',
+      attachments: [att('LS-78421.pdf', 'pdf', 180)], linkedTaskIds: ['task-ls-1'] }),
+  ev('ev-ls-02', LS, 'email', 'inbound', 'email_in', '2026-09-13T12:10:00Z',
+    'WS-99102: 120→116,4 t (−3 %), OS-AL 441.',
+    { from: 'waage@lager-nord.example', to: 'logistik@agrohub.example', subject: 'Gewichtsschein WS-99102',
+      attachments: [att('WS-99102.pdf', 'pdf', 95)], linkedTaskIds: ['task-ls-2'] }),
+  ev('ev-ls-03', LS, 'whatsapp', 'inbound', 'whatsapp_in', '2026-09-13T12:40:00Z',
+    'Waage zeigte weniger — Lkw voll, evtl. Kalibrierung?',
+    { from: '+49 151 9988776 (Fahrer)', to: 'AgroHub Logistik' }),
+  ev('ev-ls-04', LS, 'phone', 'internal', 'phone_note', '2026-09-13T13:55:00Z',
+    'Dispo: Nachwiegen unmöglich — Entscheidung nötig.',
+    { from: 'Tom Richter', durationMinutes: 5, callDirection: 'outbound',
+      suggestedFollowUps: [{ id: 'sf-ls-1', label: 'Differenz an Lieferanten melden', taskType: 'reply',
+        prefillDraft: draft(ALO, 'Differenz LS-78421', 'LS-78421: 116,4 statt 120 t (−3 %).') }] }),
+  ev('ev-rk-01', RK, 'email', 'inbound', 'email_in', '2026-09-12T08:20:00Z',
+    'Tour GF-228: Feuchte 16,8 % (Soll ≤15 %). Forderung 1.850 €.',
+    { from: 'qualitaet@hof-meyer.example', to: 'reklamation@agrohub.example', subject: 'Reklamation Mais Feuchte',
+      attachments: [att('Messprotokoll_Mais_1109.pdf', 'pdf', 140)], linkedTaskIds: ['task-rk-1'] }),
+  ev('ev-rk-02', RK, 'telegram', 'inbound', 'telegram_in', '2026-09-12T14:05:00Z',
+    'Verladeprobe 14,2 % — keine Haftung.',
+    { from: 'Spedition Grünfeld Dispo', to: 'AgroHub Reklamation' }),
+  ev('ev-rk-03', RK, 'phone', 'internal', 'phone_note', '2026-09-13T09:30:00Z',
+    'Keine Einigung. 50/50 oder Gegenprobe — blockiert.',
+    { from: 'Lisa Braun', durationMinutes: 18, callDirection: 'outbound', linkedTaskIds: ['task-rk-1'],
+      suggestedFollowUps: [
+        { id: 'sf-rk-1', label: 'Kulanzangebot an Kunden', taskType: 'reply' },
+        { id: 'sf-rk-2', label: 'Stellungnahme an Frachtführer', taskType: 'reply' },
+      ] }),
+  ev('ev-zb-01', ZB, 'email', 'inbound', 'email_in', '2026-09-11T10:12:00Z',
+    'Anbei Bio-Zertifikat, gültig bis 31.12.2027.',
+    { from: 'buero@oekohof-linden.example', to: 'qualitaet@agrohub.example', subject: 'Bio-Zertifikat 2026/27',
+      attachments: [att('BioZertifikat_Linden_2027.pdf', 'pdf', 860)], linkedTaskIds: ['task-zb-1'] }),
 ]
-
 export const tasks: Task[] = [
-  // Weizen Abrufe batch (5)
-  {
-    id: 'task-wm-1',
-    processId: 'proc-weizen-meyer',
-    taskType: 'contract_call',
-    title: 'Abruf 1/5 — 50 t Weizen KW38 Di',
-    state: 'open',
-    confidence: 'high',
-    sourceEventIds: ['ev-wm-01', 'ev-wm-02'],
-    groupId: 'grp-wm-abrufe',
-    groupIndex: 1,
-    groupTotal: 5,
-    erpDraft: {
-      kind: 'contract_call',
-      contractNumber: 'VH-2026-0412',
-      product: 'Weizen Qualität A',
-      quantityTons: 50,
-      deliveryWindow: 'KW38 Di (15.09.2026)',
-      callReference: 'ABR-0412-01',
-      fields: [
-        { field: 'contractNumber', label: 'Vertragsnr.', value: 'VH-2026-0412', status: 'ok', erpReference: 'VERTRAG/0412' },
-        { field: 'product', label: 'Artikel', value: 'Weizen Qualität A', status: 'ok', erpReference: 'ART-WEI-A' },
-        { field: 'quantityTons', label: 'Menge (t)', value: 50, status: 'ok' },
-        { field: 'deliveryWindow', label: 'Lieferfenster', value: 'KW38 Di (15.09.2026)', status: 'ok' },
-        { field: 'partner', label: 'Partner', value: 'Hof Meyer', status: 'ok', erpReference: 'KUN-10042' },
-      ],
-    },
-    communicationDraft: {
-      channel: 'email',
-      to: 'klaus.meyer@hof-meyer.example',
-      subject: 'Bestätigung Abruf 1/5 — VH-2026-0412',
-      body: 'Guten Tag Herr Meyer,\n\nwir bestätigen Abruf 1/5: 50 t Weizen Qualität A, Lieferung KW38 Dienstag.\n\nFreundliche Grüße\nAnna Keller\nAgroHub GmbH',
-      suggestedByAi: true,
-    },
-  },
-  {
-    id: 'task-wm-2',
-    processId: 'proc-weizen-meyer',
-    taskType: 'contract_call',
-    title: 'Abruf 2/5 — 50 t Weizen KW38 Do',
-    state: 'open',
-    confidence: 'high',
-    sourceEventIds: ['ev-wm-01', 'ev-wm-02'],
-    groupId: 'grp-wm-abrufe',
-    groupIndex: 2,
-    groupTotal: 5,
-    erpDraft: {
-      kind: 'contract_call',
-      contractNumber: 'VH-2026-0412',
-      product: 'Weizen Qualität A',
-      quantityTons: 50,
-      deliveryWindow: 'KW38 Do (17.09.2026)',
-      callReference: 'ABR-0412-02',
-      fields: [
-        { field: 'contractNumber', label: 'Vertragsnr.', value: 'VH-2026-0412', status: 'ok', erpReference: 'VERTRAG/0412' },
-        { field: 'product', label: 'Artikel', value: 'Weizen Qualität A', status: 'ok', erpReference: 'ART-WEI-A' },
-        { field: 'quantityTons', label: 'Menge (t)', value: 50, status: 'ok' },
-        { field: 'deliveryWindow', label: 'Lieferfenster', value: 'KW38 Do (17.09.2026)', status: 'ok' },
-        { field: 'partner', label: 'Partner', value: 'Hof Meyer', status: 'ok', erpReference: 'KUN-10042' },
-      ],
-    },
-    communicationDraft: {
-      channel: 'whatsapp',
-      to: '+49 170 1112233',
-      body: 'Abruf 2/5 bestätigt: 50 t Weizen, KW38 Donnerstag. Gruß, Anna',
-      suggestedByAi: true,
-    },
-  },
-  {
-    id: 'task-wm-3',
-    processId: 'proc-weizen-meyer',
-    taskType: 'contract_call',
-    title: 'Abruf 3/5 — 50 t Weizen KW39',
-    state: 'open',
-    confidence: 'high',
-    sourceEventIds: ['ev-wm-01'],
-    groupId: 'grp-wm-abrufe',
-    groupIndex: 3,
-    groupTotal: 5,
-    erpDraft: {
-      kind: 'contract_call',
-      contractNumber: 'VH-2026-0412',
-      product: 'Weizen Qualität A',
-      quantityTons: 50,
-      deliveryWindow: 'KW39 (22.–26.09.2026)',
-      callReference: 'ABR-0412-03',
-      fields: [
-        { field: 'contractNumber', label: 'Vertragsnr.', value: 'VH-2026-0412', status: 'ok' },
-        { field: 'product', label: 'Artikel', value: 'Weizen Qualität A', status: 'ok' },
-        { field: 'quantityTons', label: 'Menge (t)', value: 50, status: 'ok' },
-        { field: 'deliveryWindow', label: 'Lieferfenster', value: 'KW39 (22.–26.09.2026)', status: 'ok' },
-      ],
-    },
-  },
-  {
-    id: 'task-wm-4',
-    processId: 'proc-weizen-meyer',
-    taskType: 'contract_call',
-    title: 'Abruf 4/5 — 50 t Weizen KW40',
-    state: 'open',
+  abruf(1, 'KW38 Di (15.09.2026)', 'high', undefined, true),
+  abruf(2, 'KW38 Do (17.09.2026)', 'high', undefined, true),
+  abruf(3, 'KW39 (22.–26.09.2026)'),
+  abruf(4, 'KW40 (29.09.–03.10.2026)', 'medium', 'Lager Nord KW40 zu 92 % ausgelastet'),
+  abruf(5, 'KW42 (13.–17.10.2026)'),
+  task('task-pn-1', PN, 'price_update', 'Preisupdate Gerste Futterware +4,20 €/t', ['ev-pn-01', 'ev-pn-02'], {
     confidence: 'medium',
-    sourceEventIds: ['ev-wm-01'],
-    groupId: 'grp-wm-abrufe',
-    groupIndex: 4,
-    groupTotal: 5,
-    erpDraft: {
-      kind: 'contract_call',
-      contractNumber: 'VH-2026-0412',
-      product: 'Weizen Qualität A',
-      quantityTons: 50,
-      deliveryWindow: 'KW40 (29.09.–03.10.2026)',
-      callReference: 'ABR-0412-04',
-      fields: [
-        { field: 'contractNumber', label: 'Vertragsnr.', value: 'VH-2026-0412', status: 'ok' },
-        { field: 'product', label: 'Artikel', value: 'Weizen Qualität A', status: 'ok' },
-        { field: 'quantityTons', label: 'Menge (t)', value: 50, status: 'ok' },
-        {
-          field: 'deliveryWindow',
-          label: 'Lieferfenster',
-          value: 'KW40 (29.09.–03.10.2026)',
-          status: 'warning',
-          message: 'Lager Nord in KW40 zu 92 % ausgelastet',
-        },
-      ],
+    erp: {
+      kind: 'price_update', product: 'Gerste Futterware', oldPriceEur: 198.5, newPriceEur: 202.7,
+      validFrom: '2026-09-15', supplierRef: 'NK-PL-2026-09',
+      fields: F([
+        ['product', 'Gerste Futterware', 'ok', undefined, 'ART-GER-F'],
+        ['oldPriceEur', 198.5], ['newPriceEur', 202.7],
+        ['validFrom', '2026-09-15', 'warning', '2 offene Kontrakte ohne Fixpreis'],
+        ['staffel', 'nicht übernommen', 'warning', 'Staffel nicht eindeutig'],
+        ['supplier', 'Nordkorn AG', 'ok', undefined, 'LIF-20018'],
+      ]),
     },
-  },
-  {
-    id: 'task-wm-5',
-    processId: 'proc-weizen-meyer',
-    taskType: 'contract_call',
-    title: 'Abruf 5/5 — 50 t Weizen KW42',
-    state: 'open',
-    confidence: 'high',
-    sourceEventIds: ['ev-wm-01'],
-    groupId: 'grp-wm-abrufe',
-    groupIndex: 5,
-    groupTotal: 5,
-    erpDraft: {
-      kind: 'contract_call',
-      contractNumber: 'VH-2026-0412',
-      product: 'Weizen Qualität A',
-      quantityTons: 50,
-      deliveryWindow: 'KW42 (13.–17.10.2026)',
-      callReference: 'ABR-0412-05',
-      fields: [
-        { field: 'contractNumber', label: 'Vertragsnr.', value: 'VH-2026-0412', status: 'ok' },
-        { field: 'product', label: 'Artikel', value: 'Weizen Qualität A', status: 'ok' },
-        { field: 'quantityTons', label: 'Menge (t)', value: 50, status: 'ok' },
-        { field: 'deliveryWindow', label: 'Lieferfenster', value: 'KW42 (13.–17.10.2026)', status: 'ok' },
-      ],
-    },
-  },
-
-  // Preisupdate
-  {
-    id: 'task-pn-1',
-    processId: 'proc-preisupdate-nordkorn',
-    taskType: 'price_update',
-    title: 'Preisupdate Gerste Futterware +4,20 €/t',
-    state: 'open',
-    confidence: 'medium',
-    sourceEventIds: ['ev-pn-01', 'ev-pn-02'],
-    erpDraft: {
-      kind: 'price_update',
-      product: 'Gerste Futterware',
-      oldPriceEur: 198.5,
-      newPriceEur: 202.7,
-      validFrom: '2026-09-15',
-      supplierRef: 'NK-PL-2026-09',
-      fields: [
-        { field: 'product', label: 'Artikel', value: 'Gerste Futterware', status: 'ok', erpReference: 'ART-GER-F' },
-        { field: 'oldPriceEur', label: 'Alter Preis (€/t)', value: 198.5, status: 'ok' },
-        { field: 'newPriceEur', label: 'Neuer Preis (€/t)', value: 202.7, status: 'ok' },
-        {
-          field: 'validFrom',
-          label: 'Gültig ab',
-          value: '2026-09-15',
-          status: 'warning',
-          message: '2 offene Kontrakte ohne Fixpreis betroffen (NK-441, NK-455)',
-        },
-        {
-          field: 'staffel',
-          label: 'Staffelpreis',
-          value: 'nicht übernommen',
-          status: 'warning',
-          message: 'Staffel aus Anhang nicht eindeutig — manuell prüfen',
-        },
-        { field: 'supplier', label: 'Lieferant', value: 'Nordkorn AG', status: 'ok', erpReference: 'LIF-20018' },
-      ],
-    },
-    decisions: [
-      {
-        id: 'dec-pn-1',
-        label: 'Anwendung auf offene Kontrakte',
-        options: [
-          { id: 'opt-fix', label: 'Nur Listenpreis (Fixpreise unberührt)', consequence: 'Empfohlen' },
-          { id: 'opt-all', label: 'Auch auf Abrufe ohne Fixpreis anwenden', consequence: '+ca. 4.200 € Kosten' },
-          { id: 'opt-reject', label: 'Preisupdate ablehnen / nachverhandeln' },
-        ],
-      },
-    ],
-    communicationDraft: {
-      channel: 'email',
-      to: 'einkauf@nordkorn.example',
-      subject: 'RE: Preisanpassung Gerste Futterware',
-      body: 'Guten Tag,\n\nvielen Dank für die Information. Wir prüfen die Übernahme intern und melden uns bis 16.09.\n\nFreundliche Grüße\nTom Richter\nAgroHub GmbH',
-      suggestedByAi: true,
-    },
-  },
-
-  // Angebot Bauer Schmidt
-  {
-    id: 'task-bs-1',
-    processId: 'proc-angebot-bauer-schmidt',
-    taskType: 'create_quote',
-    title: 'Angebot ANG-2026-889 erstellen',
+    decisions: [{ id: 'dec-pn-1', label: 'Anwendung auf offene Kontrakte', options: [
+      { id: 'opt-fix', label: 'Nur Listenpreis', consequence: 'Empfohlen' },
+      { id: 'opt-all', label: 'Auch Abrufe ohne Fixpreis', consequence: '+ca. 4.200 €' },
+      { id: 'opt-reject', label: 'Ablehnen / nachverhandeln' },
+    ] }],
+    comm: draft('einkauf@nordkorn.example', 'RE: Preisanpassung Gerste', 'Wir prüfen intern und melden uns bis 16.09.'),
+  }),
+  task('task-bs-1', BS, 'create_quote', 'Angebot ANG-2026-889 erstellen', ['ev-bs-01'], {
     state: 'done',
-    confidence: 'high',
-    sourceEventIds: ['ev-bs-01'],
-    erpDraft: {
-      kind: 'quote',
-      quoteNumber: 'ANG-2026-889',
-      product: 'Raps Ernte 2026',
-      quantityTons: 80,
-      unitPriceEur: 512,
-      validUntil: '2026-09-20',
-      revision: 0,
-      fields: [
-        { field: 'quoteNumber', label: 'Angebotsnr.', value: 'ANG-2026-889', status: 'ok' },
-        { field: 'product', label: 'Artikel', value: 'Raps Ernte 2026', status: 'ok' },
-        { field: 'quantityTons', label: 'Menge (t)', value: 80, status: 'ok' },
-        { field: 'unitPriceEur', label: 'Preis (€/t)', value: 512, status: 'ok' },
-        { field: 'validUntil', label: 'Gültig bis', value: '2026-09-20', status: 'ok' },
-      ],
+    erp: {
+      kind: 'quote', quoteNumber: 'ANG-2026-889', product: 'Raps Ernte 2026', quantityTons: 80,
+      unitPriceEur: 512, validUntil: '2026-09-20', revision: 0,
+      fields: F([
+        ['quoteNumber', 'ANG-2026-889'], ['product', 'Raps Ernte 2026'], ['quantityTons', 80],
+        ['unitPriceEur', 512], ['validUntil', '2026-09-20'],
+      ]),
     },
-  },
-  {
-    id: 'task-bs-2',
-    processId: 'proc-angebot-bauer-schmidt',
-    taskType: 'revise_quote',
-    title: 'Angebot Rev. 1 — 510,50 €/t',
+  }),
+  task('task-bs-2', BS, 'revise_quote', 'Angebot Rev. 1 — 510,50 €/t', ['ev-bs-03', 'ev-bs-04'], {
     state: 'awaiting_approval',
-    confidence: 'high',
-    sourceEventIds: ['ev-bs-03', 'ev-bs-04'],
-    erpDraft: {
-      kind: 'quote',
-      quoteNumber: 'ANG-2026-889',
-      product: 'Raps Ernte 2026',
-      quantityTons: 80,
-      unitPriceEur: 510.5,
-      validUntil: '2026-09-22',
-      revision: 1,
-      fields: [
-        { field: 'quoteNumber', label: 'Angebotsnr.', value: 'ANG-2026-889', status: 'ok' },
-        { field: 'revision', label: 'Revision', value: 1, status: 'ok' },
-        { field: 'product', label: 'Artikel', value: 'Raps Ernte 2026', status: 'ok' },
-        { field: 'quantityTons', label: 'Menge (t)', value: 80, status: 'ok' },
-        { field: 'unitPriceEur', label: 'Preis (€/t)', value: 510.5, status: 'ok' },
-        { field: 'validUntil', label: 'Gültig bis', value: '2026-09-22', status: 'ok' },
-        { field: 'margin', label: 'Marge', value: '4,2 %', status: 'ok', message: 'Über Mindestmarge' },
-      ],
+    erp: {
+      kind: 'quote', quoteNumber: 'ANG-2026-889', product: 'Raps Ernte 2026', quantityTons: 80,
+      unitPriceEur: 510.5, validUntil: '2026-09-22', revision: 1,
+      fields: F([
+        ['quoteNumber', 'ANG-2026-889'], ['revision', 1], ['product', 'Raps Ernte 2026'],
+        ['quantityTons', 80], ['unitPriceEur', 510.5], ['validUntil', '2026-09-22'],
+        ['margin', '4,2 %', 'ok', 'Über Mindestmarge'],
+      ]),
     },
-    communicationDraft: {
-      channel: 'email',
-      to: 'info@bauer-schmidt.example',
-      subject: 'Nachfrage zu Angebot ANG-2026-889 Rev. 1',
-      body: 'Guten Tag Familie Schmidt,\n\ndürfen wir kurz nachfragen, ob das revidierte Angebot (510,50 €/t) Ihren Vorstellungen entspricht?\n\nFreundliche Grüße\nAnna Keller\nAgroHub GmbH',
-      suggestedByAi: true,
+    comm: draft(SCHMIDT, 'Nachfrage ANG-2026-889 Rev. 1', 'Passt 510,50 €/t?'),
+  }),
+  task('task-ls-1', LS, 'delivery_note', 'Lieferschein LS-78421 erfassen', ['ev-ls-01'], {
+    erp: {
+      kind: 'delivery_note', deliveryNoteNumber: 'LS-78421', product: 'Weizen',
+      declaredTons: 120, actualTons: 116.4, warehouse: 'Lager Nord',
+      fields: F([
+        ['deliveryNoteNumber', 'LS-78421'], ['product', 'Weizen', 'ok', undefined, 'ART-WEI-A'],
+        ['declaredTons', 120], ['actualTons', 116.4, 'error', 'Abweichung −3 % über Toleranz'],
+        ['warehouse', 'Lager Nord', 'ok', undefined, 'LAG-NORD'],
+      ]),
     },
-  },
-
-  // Lieferschein + Waage
-  {
-    id: 'task-ls-1',
-    processId: 'proc-lieferschein-abweichung',
-    taskType: 'delivery_note',
-    title: 'Lieferschein LS-78421 erfassen',
-    state: 'open',
-    confidence: 'high',
-    sourceEventIds: ['ev-ls-01'],
-    erpDraft: {
-      kind: 'delivery_note',
-      deliveryNoteNumber: 'LS-78421',
-      product: 'Weizen',
-      declaredTons: 120,
-      actualTons: 116.4,
-      warehouse: 'Lager Nord',
-      fields: [
-        { field: 'deliveryNoteNumber', label: 'Lieferscheinnr.', value: 'LS-78421', status: 'ok' },
-        { field: 'product', label: 'Artikel', value: 'Weizen', status: 'ok', erpReference: 'ART-WEI-A' },
-        { field: 'declaredTons', label: 'Deklariert (t)', value: 120, status: 'ok' },
-        {
-          field: 'actualTons',
-          label: 'Gewogen (t)',
-          value: 116.4,
-          status: 'error',
-          message: 'Abweichung −3,0 % über Toleranz (1,5 %)',
-        },
-        { field: 'warehouse', label: 'Lager', value: 'Lager Nord', status: 'ok', erpReference: 'LAG-NORD' },
-      ],
-    },
-  },
-  {
-    id: 'task-ls-2',
-    processId: 'proc-lieferschein-abweichung',
-    taskType: 'weighbridge',
-    title: 'Waagenticket WS-99102 — Abweichung',
-    state: 'open',
+  }),
+  task('task-ls-2', LS, 'weighbridge', 'Waagenticket WS-99102 — Abweichung', ['ev-ls-02'], {
     confidence: 'medium',
-    sourceEventIds: ['ev-ls-02'],
-    erpDraft: {
-      kind: 'weighbridge',
-      ticketNumber: 'WS-99102',
-      declaredTons: 120,
-      weighedTons: 116.4,
-      deviationPercent: -3.0,
-      vehiclePlate: 'OS-AL 441',
-      fields: [
-        { field: 'ticketNumber', label: 'Ticketnr.', value: 'WS-99102', status: 'ok' },
-        { field: 'declaredTons', label: 'Deklariert (t)', value: 120, status: 'ok' },
-        { field: 'weighedTons', label: 'Gewogen (t)', value: 116.4, status: 'ok' },
-        {
-          field: 'deviationPercent',
-          label: 'Abweichung (%)',
-          value: -3.0,
-          status: 'error',
-          message: 'Über Toleranz — Entscheidung erforderlich',
-        },
-        { field: 'vehiclePlate', label: 'Kennzeichen', value: 'OS-AL 441', status: 'ok' },
-      ],
+    erp: {
+      kind: 'weighbridge', ticketNumber: 'WS-99102', declaredTons: 120, weighedTons: 116.4,
+      deviationPercent: -3, vehiclePlate: 'OS-AL 441',
+      fields: F([
+        ['ticketNumber', 'WS-99102'], ['declaredTons', 120], ['weighedTons', 116.4],
+        ['deviationPercent', -3, 'error', 'Über Toleranz'], ['vehiclePlate', 'OS-AL 441'],
+      ]),
     },
-    decisions: [
-      {
-        id: 'dec-ls-1',
-        label: 'Umgang mit Mengendifferenz',
-        options: [
-          { id: 'opt-recalc', label: 'Nachberechnung auf 116,4 t', consequence: 'Gutschrift an Lieferant' },
-          { id: 'opt-kulanz', label: 'Kulanz — 120 t belassen', consequence: 'Differenz intern tragen' },
-          { id: 'opt-claim', label: 'Reklamation an Frachtführer', consequence: 'Neuer Prozess' },
-        ],
-      },
-    ],
-    communicationDraft: {
-      channel: 'email',
-      to: 'disposition@agrarlogistik-ost.example',
-      subject: 'Differenz LS-78421 / WS-99102',
-      body: 'Guten Tag,\n\nbei LS-78421 ergibt die Waage 116,4 t statt 120 t (−3 %). Bitte um kurze Stellungnahme.\n\nFreundliche Grüße\nTom Richter\nAgroHub GmbH',
-      suggestedByAi: true,
+    decisions: [{ id: 'dec-ls-1', label: 'Umgang mit Mengendifferenz', options: [
+      { id: 'opt-recalc', label: 'Nachberechnung 116,4 t', consequence: 'Gutschrift Lieferant' },
+      { id: 'opt-kulanz', label: 'Kulanz — 120 t belassen', consequence: 'Differenz intern' },
+      { id: 'opt-claim', label: 'Reklamation Frachtführer', consequence: 'Neuer Prozess' },
+    ] }],
+    comm: draft(ALO, 'Differenz LS-78421', 'LS-78421: 116,4 statt 120 t (−3 %).'),
+  }),
+  task('task-rk-1', RK, 'complaint', 'Reklamation Feuchte Mais — Haftung klären', ['ev-rk-01', 'ev-rk-03'], {
+    state: 'blocked', confidence: 'low', blockingReason: 'Haftung offen — Kunde vs. Frachtführer.',
+    erp: {
+      kind: 'complaint', complaintRef: 'REK-2026-044', category: 'Qualität / Feuchtigkeit',
+      relatedDelivery: 'Tour GF-228', claimedAmountEur: 1850,
+      fields: F([
+        ['complaintRef', 'REK-2026-044'], ['category', 'Qualität / Feuchtigkeit'],
+        ['relatedDelivery', 'Tour GF-228'], ['claimedAmountEur', 1850, 'warning', 'Nicht freigegeben'],
+        ['moisture', '16,8 % (Soll ≤15 %)', 'error', 'Grenzwert überschritten'],
+        ['carrierClaim', '14,2 % bei Verladung', 'warning', 'Widerspruch'],
+      ]),
     },
-  },
-
-  // Reklamation
-  {
-    id: 'task-rk-1',
-    processId: 'proc-reklamation-fracht',
-    taskType: 'complaint',
-    title: 'Reklamation Feuchte Mais — Haftung klären',
-    state: 'blocked',
-    confidence: 'low',
-    sourceEventIds: ['ev-rk-01', 'ev-rk-03'],
-    blockingReason: 'Haftungsentscheidung ausstehend — Kunde vs. Frachtführer widersprechen sich.',
-    erpDraft: {
-      kind: 'complaint',
-      complaintRef: 'REK-2026-044',
-      category: 'Qualität / Feuchtigkeit',
-      relatedDelivery: 'Tour GF-228',
-      claimedAmountEur: 1850,
-      fields: [
-        { field: 'complaintRef', label: 'Reklamationsnr.', value: 'REK-2026-044', status: 'ok' },
-        { field: 'category', label: 'Kategorie', value: 'Qualität / Feuchtigkeit', status: 'ok' },
-        { field: 'relatedDelivery', label: 'Tour/Lieferung', value: 'Tour GF-228', status: 'ok' },
-        {
-          field: 'claimedAmountEur',
-          label: 'Forderung (€)',
-          value: 1850,
-          status: 'warning',
-          message: 'Höhe noch nicht freigegeben',
-        },
-        {
-          field: 'moisture',
-          label: 'Feuchte gemessen',
-          value: '16,8 % (Soll ≤15 %)',
-          status: 'error',
-          message: 'Grenzwert überschritten',
-        },
-        {
-          field: 'carrierClaim',
-          label: 'Frachtführer-Angabe',
-          value: '14,2 % bei Verladung',
-          status: 'warning',
-          message: 'Widerspruch — Belege prüfen',
-        },
-      ],
+    decisions: [{ id: 'dec-rk-1', label: 'Haftungsentscheidung', options: [
+      { id: 'opt-customer', label: 'Volle Gutschrift Kunde (1.850 €)', consequence: 'Kosten AgroHub' },
+      { id: 'opt-5050', label: '50/50 Kulanz', consequence: '925 € je Partei' },
+      { id: 'opt-carrier', label: 'Volle Belastung Frachtführer', consequence: 'Konfliktrisiko' },
+      { id: 'opt-lab', label: 'Externe Gegenprobe', consequence: 'Zeit + Kosten' },
+    ] }],
+    comm: draft(
+      ['qualitaet@hof-meyer.example', 'dispo@gruenfeld-spedition.example'],
+      'REK-2026-044', 'Wir prüfen die Feuchtewerte.',
+    ),
+  }),
+  task('task-zb-1', ZB, 'certification', 'Bio-Zertifikat ÖkoHof Linden anlegen', ['ev-zb-01'], {
+    erp: {
+      kind: 'certification', certificateType: 'Bio EU', certificateNumber: 'DE-ÖKO-039-2026-1188',
+      validUntil: '2027-12-31', product: 'Bio-Getreide (Sortiment)',
+      fields: F([
+        ['certificateType', 'Bio EU'], ['certificateNumber', 'DE-ÖKO-039-2026-1188'],
+        ['validUntil', '2027-12-31'], ['supplier', 'ÖkoHof Linden', 'ok', undefined, 'LIF-30007'],
+        ['product', 'Bio-Getreide (Sortiment)'],
+      ]),
     },
-    decisions: [
-      {
-        id: 'dec-rk-1',
-        label: 'Haftungs- und Regulierungsentscheidung',
-        options: [
-          { id: 'opt-customer', label: 'Volle Gutschrift an Kunden (1.850 €)', consequence: 'Kosten AgroHub' },
-          { id: 'opt-5050', label: '50/50 Kulanz Kunde / Frachtführer', consequence: '925 € je Partei' },
-          { id: 'opt-carrier', label: 'Volle Belastung Frachtführer', consequence: 'Konfliktrisiko hoch' },
-          { id: 'opt-lab', label: 'Externe Gegenprobe beauftragen', consequence: 'Zeitverzögerung + Kosten' },
-        ],
-      },
-    ],
-    communicationDraft: {
-      channel: 'email',
-      to: ['qualitaet@hof-meyer.example', 'dispo@gruenfeld-spedition.example'],
-      subject: 'REK-2026-044 — Zwischenstand Feuchte Mais',
-      body: 'Guten Tag,\n\nwir prüfen die widersprüchlichen Feuchtewerte und melden uns mit einem Lösungsvorschlag.\n\nFreundliche Grüße\nLisa Braun\nAgroHub GmbH',
-      suggestedByAi: true,
-    },
-  },
-
-  // Zertifikat
-  {
-    id: 'task-zb-1',
-    processId: 'proc-zertifikat-bio',
-    taskType: 'certification',
-    title: 'Bio-Zertifikat ÖkoHof Linden anlegen',
-    state: 'open',
-    confidence: 'high',
-    sourceEventIds: ['ev-zb-01'],
-    erpDraft: {
-      kind: 'certification',
-      certificateType: 'Bio EU',
-      certificateNumber: 'DE-ÖKO-039-2026-1188',
-      validUntil: '2027-12-31',
-      product: 'Bio-Getreide (Sortiment)',
-      fields: [
-        { field: 'certificateType', label: 'Zertifikatstyp', value: 'Bio EU', status: 'ok' },
-        { field: 'certificateNumber', label: 'Zertifikatsnr.', value: 'DE-ÖKO-039-2026-1188', status: 'ok' },
-        { field: 'validUntil', label: 'Gültig bis', value: '2027-12-31', status: 'ok' },
-        { field: 'supplier', label: 'Lieferant', value: 'ÖkoHof Linden', status: 'ok', erpReference: 'LIF-30007' },
-        { field: 'product', label: 'Geltungsbereich', value: 'Bio-Getreide (Sortiment)', status: 'ok' },
-      ],
-    },
-  },
+  }),
 ]
-
-export const initialSelectedProcessId = 'proc-weizen-meyer'
+export const initialSelectedProcessId = WM
